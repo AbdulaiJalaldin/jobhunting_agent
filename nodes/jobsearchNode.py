@@ -2,27 +2,26 @@ import os
 import json
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
+from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from state import StateClass
 from db import get_user
 
-# Import your existing function that fetches the FULL job data
 from tools.searchtool import search_jobs as execute_search
 
 load_dotenv() 
 
 SEARCH_SYSTEM_PROMPT = """You are an expert job search query builder.
-Your ONLY job is to call the search_jobs tool with the best possible queries.
+Your ONLY job is to call the search_jobs_tool with the best possible queries.
 
 CRITICAL RULES:
 1. QUERIES MUST BE SHORT (2-4 words MAX). 
-   - GOOD: "AI Engineer", "Python Developer", "Backend Engineer"
-   - BAD: "AI Engineer Python LangChain LangGraph LLM" (This will return 0 jobs!)
+   - GOOD EXAMPLES: "AI Engineer", "Python Developer", "Backend Engineer"
+   - BAD EXAMPLES: "AI Engineer Python LangChain LangGraph LLM" (This will return 0 jobs!)
 2. Make EXACTLY 2 or 3 separate tool calls with different short job titles.
 3. Factor in their location preference from USER_PREFERENCES.
 4. ONCE YOU HAVE MADE 3 TOOL CALLS, YOU MUST STOP. Do not make any more tool calls.
 """
-
 # 🌟 CLEANER APPROACH: Define the tool schema as a dictionary.
 # This tells the LLM the tool exists, but we handle the execution manually in the loop.
 JOB_SEARCH_TOOL_SCHEMA = {
@@ -53,8 +52,28 @@ def get_llm():
         temperature=0,
         api_key=os.getenv("GROQ_API_KEY")
     )
-    # Bind the schema dictionary instead of a @tool function
     return llm.bind_tools([JOB_SEARCH_TOOL_SCHEMA])
+
+# 🆕 HELPER FUNCTION: Translates user text into API enums
+def get_api_filters(user_answers: dict):
+    """Maps user's raw text input to OpenWeb Ninja API enum values."""
+    # Map Job Type
+    raw_job_type = user_answers.get("job_type", "").lower()
+    employment_type = ""
+    if "full" in raw_job_type: employment_type = "FULLTIME"
+    elif "part" in raw_job_type: employment_type = "PARTTIME"
+    elif "intern" in raw_job_type: employment_type = "INTERN"
+    elif "contract" in raw_job_type: employment_type = "CONTRACTOR"
+    
+    # Map Date Posted
+    raw_duration = user_answers.get("job_posting_duration", "").lower()
+    date_posted = "all"
+    if "24" in raw_duration or "today" in raw_duration or "1 day" in raw_duration: date_posted = "today"
+    elif "7" in raw_duration or "week" in raw_duration: date_posted = "week"
+    elif "30" in raw_duration or "month" in raw_duration: date_posted = "month"
+    elif "3" in raw_duration: date_posted = "3days"
+    
+    return employment_type, date_posted
 
 def job_search_node(state: StateClass):
     print(f"🔍 Searching jobs for user: {state['user_id']}")
@@ -82,7 +101,7 @@ Search for relevant jobs for this user using the tool. Make 2-3 varied, SHORT qu
     ]
 
     llm_with_tools = get_llm()
-    all_jobs = [] # This will hold the FULL job data for the matching node
+    all_jobs = []
     
     total_tool_calls = 0
     MAX_TOOL_CALLS = 3
@@ -91,7 +110,6 @@ Search for relevant jobs for this user using the tool. Make 2-3 varied, SHORT qu
         response = llm_with_tools.invoke(messages)
         messages.append(response)
 
-        # Break if we hit the limit or the AI decides to stop
         if total_tool_calls >= MAX_TOOL_CALLS or not response.tool_calls:
             break
 
@@ -104,20 +122,27 @@ Search for relevant jobs for this user using the tool. Make 2-3 varied, SHORT qu
             tool_id = tool_call['id']
 
             if tool_name == 'search_jobs':
-                # 🌟 STEP 1: Fetch the FULL jobs from the API (1500-char descriptions)
-                full_jobs = execute_search(query=tool_args['query'], location=tool_args.get('location', ''))
+                # 🚀 STATE INJECTION: Get the user's strict preferences from the state
+                emp_type, date_filter = get_api_filters(user_answers)
+                
+                # 🚀 Call the raw API function directly, injecting the filters!
+                full_jobs = execute_search(
+                    query=tool_args['query'], 
+                    location=tool_args.get('location', ''),
+                    employment_type=emp_type,
+                    date_posted=date_filter
+                )
                 
                 if full_jobs:
-                    # 🌟 STEP 2: Save FULL jobs to our accumulator (for the matching node)
                     all_jobs.extend(full_jobs)
                     
-                    # 🌟 STEP 3: Create a TRUNCATED version for the LLM (prevents 413 error)
+                    # Create truncated version for the LLM to prevent 413 errors
                     llm_friendly_jobs = [{
                         "title": j.get("title"),
                         "company": j.get("company"),
                         "location": j.get("location"),
                         "employment_type": j.get("employment_type"),
-                        "description_snippet": j.get("description", "")[:200] + "...", # Truncated!
+                        "description_snippet": j.get("description", "")[:200] + "...",
                         "apply_url": j.get("apply_url")
                     } for j in full_jobs]
                     
@@ -127,13 +152,12 @@ Search for relevant jobs for this user using the tool. Make 2-3 varied, SHORT qu
 
                 total_tool_calls += 1
                 
-                # 🌟 STEP 4: Send only the TRUNCATED string to the LLM
                 messages.append(ToolMessage(
                     content=tool_result_str,
                     tool_call_id=tool_id
                 ))
 
-    # Deduplicate by apply_url (using the FULL job data)
+    # Deduplicate by apply_url
     seen = set()
     unique_jobs = []
     for job in all_jobs:
@@ -143,7 +167,7 @@ Search for relevant jobs for this user using the tool. Make 2-3 varied, SHORT qu
 
     print(f"\n✅ Total unique jobs found: {len(unique_jobs)}")
 
-    # 🎉 TERMINAL DISPLAY FOR SUPERVISOR (Using full data)
+    # 🎉 TERMINAL DISPLAY FOR SUPERVISOR
     print("\n" + "="*80)
     print("📋 EXTRACTED JOB LISTINGS:")
     print("="*80)
@@ -152,7 +176,7 @@ Search for relevant jobs for this user using the tool. Make 2-3 varied, SHORT qu
         print(f"\n[{i}] {job.get('title', 'N/A')} @ {job.get('company', 'N/A')}")
         print(f"    📍 Location: {job.get('location', 'N/A')} {'(Remote)' if job.get('is_remote') else ''}")
         print(f"    💼 Type: {job.get('employment_type', 'N/A')}")
-        print(f"    📝 Description: {job.get('description', '')[:250]}...") 
+        print(f"    📝 Description: {job.get('description', '')[:250]}...")
         print(f"    🔗 Apply: {job.get('apply_url', 'N/A')}")
         
         skills = job.get('required_skills', [])
@@ -162,6 +186,6 @@ Search for relevant jobs for this user using the tool. Make 2-3 varied, SHORT qu
     print("\n" + "="*80 + "\n")
 
     return {
-        "raw_job_listings": unique_jobs, # <-- This contains the FULL descriptions for the next node!
+        "raw_job_listings": unique_jobs,
         "job_search_complete": True
     }

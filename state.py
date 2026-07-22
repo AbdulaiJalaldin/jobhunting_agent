@@ -12,6 +12,11 @@ class StateClass(TypedDict):
     user_answers: dict
     job_search_complete: bool
     raw_job_listings: list
+    matched_jobs: list
     job_results: str
     job_match_complete: bool
+    trigger_networking: bool
+    recommended_companies: list
+    networking_results: list
+    networking_complete: bool
 

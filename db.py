@@ -24,7 +24,7 @@ def init_db():
             )
         """)
         conn.commit()
-    print("✅ Database initialized.")
+    print("Database initialized.")
 
 def upsert_user(user_id: str, structured_profile: dict, full_resume_text: str, user_answers: dict):
     """Insert or update a user record."""
@@ -47,7 +47,7 @@ def upsert_user(user_id: str, structured_profile: dict, full_resume_text: str, u
             now
         ))
         conn.commit()
-    print(f"✅ User {user_id} saved to DB.")
+    print(f"User {user_id} saved to DB.")
 
 def get_user(user_id: str) -> dict | None:
     """Fetch a user record by user_id."""

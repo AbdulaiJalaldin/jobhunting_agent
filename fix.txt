@@ -1,0 +1,8 @@
+connect network node
+jobdate
+type of job
+loop
+tracking jobs
+no restarting
+try caching
+correct tooling 

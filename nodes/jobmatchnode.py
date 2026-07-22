@@ -1,5 +1,6 @@
-import os
 import json
+import os
+import re
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -15,30 +16,70 @@ Your goal is to match and rank job listings against a user's full resume and pre
 You will receive:
 - USER_RESUME: full resume text for deep skill and experience matching
 - USER_PREFERENCES: location, remote preference, and other answers
-- JOB_LISTINGS: raw jobs fetched from a search API
+- JOB_LISTINGS: pre-filtered jobs fetched from a search API
 
 Your responsibilities:
 1. Read the resume carefully — note years of experience, tech stack, seniority, and career trajectory.
-2. Score each job against the resume over 10. Consider:
-   - Skill overlap (required skills vs user skills)
-   - Location/remote alignment with preferences
-   - Growth potential and role relevance
-3. Select the top 3-5 jobs only. Discard weak matches.
-4. For each recommended job provide:
-   - Job title and company
-   - Location (remote/hybrid/on-site)
-   - Why it fits this specific user (brief summary)
-   - Any honest caveats if the match isn't perfect
-   - Apply URL
-5. Start with a 1-2 sentence summary of the overall search quality.
-6. Be honest — if results are weak, say so and suggest better search terms.
-7. Never hallucinate job details. Only use what is in JOB_LISTINGS.
+2. Score each job against the resume out of 10. Consider skill overlap, location/remote alignment, and role relevance.
+3. Select the top 3-5 jobs only. Discard weak matches. Never return more than 5.
+4. Be honest — if results are weak, say so in the summary and suggest better search terms.
+5. Never hallucinate job details. Only recommend jobs that appear in JOB_LISTINGS.
 
-Tone: supportive, practical, and clear. You are on the user's side.
+RESPONSE FORMAT — return ONLY valid JSON, no markdown, no code fences, no extra text:
+{
+  "summary": "1-2 sentence overview of search quality and overall fit",
+  "recommendations": [
+    {
+      "apply_url": "exact apply_url from JOB_LISTINGS",
+      "score": 8,
+      "why_it_fits": "2-3 sentences explaining why this job fits this specific user"
+    }
+  ]
+}
+
+Rules for recommendations:
+- Each apply_url MUST exactly match one job in JOB_LISTINGS.
+- Include score as an integer from 1-10.
+- Do NOT include apply links, caveats sections, or markdown formatting in why_it_fits.
+- Do NOT mention missing information as a separate caveats block — fold honest notes briefly into why_it_fits if needed.
 """
 
+
+def _parse_llm_json(content: str) -> dict:
+    text = content.strip()
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    if fence_match:
+        text = fence_match.group(1).strip()
+    return json.loads(text)
+
+
+def _resolve_matched_jobs(recommendations: list, shortlisted: list) -> list:
+    jobs_by_url = {
+        job.get("apply_url"): job
+        for job in shortlisted
+        if job.get("apply_url")
+    }
+
+    matched = []
+    seen_urls = set()
+    for rec in recommendations[:5]:
+        url = rec.get("apply_url")
+        if not url or url in seen_urls:
+            continue
+        job = jobs_by_url.get(url)
+        if not job:
+            continue
+        seen_urls.add(url)
+        enriched = job.copy()
+        enriched["match_score"] = rec.get("score")
+        enriched["why_it_fits"] = rec.get("why_it_fits", "")
+        matched.append(enriched)
+
+    return matched
+
+
 def job_match_node(state: StateClass):
-    print(f"🎯 Matching jobs for user: {state['user_id']}")
+    print(f"Matching jobs for user: {state['user_id']}")
 
     user_data = get_user(state["user_id"])
     if not user_data:
@@ -51,15 +92,13 @@ def job_match_node(state: StateClass):
     if not raw_job_listings:
         return {
             "job_results": "No job listings were found to match against. Try refining your search.",
-            "job_match_complete": True
+            "matched_jobs": [],
+            "job_match_complete": True,
         }
 
-    # Pre-filter to top 8 most relevant jobs (no truncation needed — quality over quantity)
-    user_data = get_user(state["user_id"])
     structured_profile = user_data["structured_profile"]
     shortlisted = shortlist_jobs(raw_job_listings, structured_profile)
 
-    # Now you can afford 800 chars per description since you only have 8 jobs
     jobs_for_llm = []
     for job in shortlisted:
         job_copy = job.copy()
@@ -76,35 +115,63 @@ USER_PREFERENCES:
 JOB_LISTINGS:
 {json.dumps(jobs_for_llm, indent=2)}
 
-Please match, score, and recommend the best jobs for this user.
+Return JSON with your top 3-5 recommendations only.
 """
 
     messages = [
         SystemMessage(content=MATCH_SYSTEM_PROMPT),
-        HumanMessage(content=user_message)
+        HumanMessage(content=user_message),
     ]
 
-    # 🚀 Initialize ChatGroq (No more raw HTTP requests!)
     llm = ChatGroq(
         model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-        temperature=0.3, # Slightly higher temperature for a better coaching tone
-        api_key=os.getenv("GROQ_API_KEY")
+        temperature=0.2,
+        api_key=os.getenv("GROQ_API_KEY"),
     )
 
-    # Invoke the LLM
     response = llm.invoke(messages)
-    final_response = response.content
+    try:
+        parsed = _parse_llm_json(response.content)
+    except (json.JSONDecodeError, TypeError):
+        matched_jobs = shortlisted[:5]
+        summary = "Here are your top job matches based on your profile."
+        recommended_companies = list({
+            job.get("company", "")
+            for job in matched_jobs
+            if job.get("company")
+        })
+        return {
+            "job_results": summary,
+            "matched_jobs": matched_jobs,
+            "recommended_companies": recommended_companies,
+            "job_match_complete": True,
+        }
 
-    print("✅ Job matching complete.")
-    
-    # 🎉 TERMINAL DISPLAY FOR SUPERVISOR
-    print("\n" + "="*80)
-    print("🏆 AI JOB COACH RECOMMENDATIONS:")
-    print("="*80)
-    print(final_response)
-    print("="*80 + "\n")
+    summary = parsed.get("summary", "Here are your top job matches.")
+    recommendations = parsed.get("recommendations", [])
+    matched_jobs = _resolve_matched_jobs(recommendations, shortlisted)
+
+    if not matched_jobs and shortlisted:
+        matched_jobs = shortlisted[:5]
+
+    print("Job matching complete.")
+    print("\n" + "=" * 80)
+    print("AI JOB COACH RECOMMENDATIONS:")
+    print("=" * 80)
+    print(summary)
+    for job in matched_jobs:
+        print(f"- {job.get('title')} @ {job.get('company')} ({job.get('match_score', '?')}/10)")
+    print("=" * 80 + "\n")
+
+    recommended_companies = list({
+        job.get("company", "")
+        for job in matched_jobs
+        if job.get("company")
+    })
 
     return {
-        "job_results": final_response,
-        "job_match_complete": True
+        "job_results": summary,
+        "matched_jobs": matched_jobs,
+        "recommended_companies": recommended_companies,
+        "job_match_complete": True,
     }
